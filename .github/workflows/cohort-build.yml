@@ -37,6 +37,7 @@ jobs:
 
       - name: Fetch build brief
         run: |
+          echo "::add-mask::$BRIEF_TOKEN"
           curl -sf -H "Authorization: Bearer $BRIEF_TOKEN" "${{ inputs.brief_url }}" -o /tmp/brief.json
           python3 -c "import json; print(json.load(open('/tmp/brief.json'))['brief'])" > /tmp/brief.md
           echo "Brief fetched ($(wc -c < /tmp/brief.md) bytes)"
