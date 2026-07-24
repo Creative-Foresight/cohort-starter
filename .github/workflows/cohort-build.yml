@@ -52,7 +52,10 @@ jobs:
           npm install -g @openai/codex
           # Codex CLI ignores the OPENAI_API_KEY env var — it requires an explicit login.
           printenv OPENAI_API_KEY | codex login --with-api-key
-          ${{ vars.COHORT_BUILD_COMMAND || 'codex exec --sandbox workspace-write "$(cat /tmp/brief.md)"' }}
+          # Codex's own bubblewrap sandbox cannot start inside Actions runners
+          # (bwrap loopback needs caps the runner doesn't grant). The ephemeral
+          # runner VM with a read-only GITHUB_TOKEN is the sandbox here.
+          ${{ vars.COHORT_BUILD_COMMAND || 'codex exec --dangerously-bypass-approvals-and-sandbox "$(cat /tmp/brief.md)"' }}
 
       - name: Report changed files to Cohort
         run: |
