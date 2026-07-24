@@ -1,0 +1,91 @@
+name: Cohort Build
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      brief_url:
+        required: true
+        type: string
+      brief_token:
+        required: true
+        type: string
+      cohort_base_url:
+        required: true
+        type: string
+
+# The runner never pushes code — Cohort opens the PR after deterministic
+# checks. Do NOT widen these permissions; the build lane depends on them.
+permissions:
+  contents: read
+
+concurrency: cohort-build-${{ inputs.build_id }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BRIEF_TOKEN: ${{ inputs.brief_token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch build brief
+        run: |
+          curl -sf -H "Authorization: Bearer $BRIEF_TOKEN" "${{ inputs.brief_url }}" -o /tmp/brief.json
+          python3 -c "import json; print(json.load(open('/tmp/brief.json'))['brief'])" > /tmp/brief.md
+          echo "Brief fetched ($(wc -c < /tmp/brief.md) bytes)"
+
+      - name: Run coding engine
+        env:
+          OPENAI_API_KEY: ${{ secrets.COHORT_BUILD_OPENAI_API_KEY }}
+        run: |
+          npm install -g @openai/codex
+          ${{ vars.COHORT_BUILD_COMMAND || 'codex exec --sandbox workspace-write "$(cat /tmp/brief.md)"' }}
+
+      - name: Report changed files to Cohort
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys, urllib.request
+
+          status = subprocess.run(
+              ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
+          ).stdout.splitlines()
+          files = []
+          for line in status:
+              code, path = line[:2], line[3:].strip()
+              if path.startswith('"') and path.endswith('"'):
+                  path = json.loads(path)
+              if "D" in code:
+                  print(f"skip (deletion unsupported in v1): {path}")
+                  continue
+              if not os.path.isfile(path):
+                  continue
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      files.append({"path": path, "content": f.read()})
+              except UnicodeDecodeError:
+                  print(f"skip (binary): {path}")
+          if not files:
+              print("No changed files produced by the engine — reporting failure.")
+              sys.exit(1)
+
+          summary = open("/tmp/brief.md", encoding="utf-8").read().strip().splitlines()[0][:200] or "Cohort build"
+          body = json.dumps({"summary": summary, "files": files}).encode()
+          req = urllib.request.Request(
+              "${{ inputs.cohort_base_url }}/api/v1/builds/${{ inputs.build_id }}/report",
+              data=body,
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {os.environ['BRIEF_TOKEN']}",
+                  "Content-Type": "application/json",
+              },
+          )
+          with urllib.request.urlopen(req) as res:
+              print(f"report accepted: HTTP {res.status}")
+          PYEOF
