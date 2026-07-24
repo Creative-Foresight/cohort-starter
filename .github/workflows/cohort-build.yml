@@ -45,7 +45,13 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.COHORT_BUILD_OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::COHORT_BUILD_OPENAI_API_KEY repo secret is missing or empty — add it in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
           npm install -g @openai/codex
+          # Codex CLI ignores the OPENAI_API_KEY env var — it requires an explicit login.
+          printenv OPENAI_API_KEY | codex login --with-api-key
           ${{ vars.COHORT_BUILD_COMMAND || 'codex exec --sandbox workspace-write "$(cat /tmp/brief.md)"' }}
 
       - name: Report changed files to Cohort
