@@ -8,8 +8,9 @@ on:
       brief_url:
         required: true
         type: string
+      # legacy, ignored — runner authenticates via OIDC
       brief_token:
-        required: true
+        required: false
         type: string
       cohort_base_url:
         required: true
@@ -19,6 +20,7 @@ on:
 # checks. Do NOT widen these permissions; the build lane depends on them.
 permissions:
   contents: read
+  id-token: write
 
 concurrency: cohort-build-${{ inputs.build_id }}
 
@@ -26,8 +28,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      BRIEF_TOKEN: ${{ inputs.brief_token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +37,8 @@ jobs:
 
       - name: Fetch build brief
         run: |
-          echo "::add-mask::$BRIEF_TOKEN"
-          curl -sf -H "Authorization: Bearer $BRIEF_TOKEN" "${{ inputs.brief_url }}" -o /tmp/brief.json
+          OIDC_TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cohort-builds" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+          curl -sf -H "Authorization: Bearer $OIDC_TOKEN" "${{ inputs.brief_url }}" -o /tmp/brief.json
           python3 -c "import json; print(json.load(open('/tmp/brief.json'))['brief'])" > /tmp/brief.md
           echo "Brief fetched ($(wc -c < /tmp/brief.md) bytes)"
 
@@ -60,6 +60,8 @@ jobs:
 
       - name: Report changed files to Cohort
         run: |
+          OIDC_TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=cohort-builds" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+          export OIDC_TOKEN
           python3 - <<'PYEOF'
           import json, os, subprocess, sys, urllib.request
 
@@ -92,7 +94,7 @@ jobs:
               data=body,
               method="POST",
               headers={
-                  "Authorization": f"Bearer {os.environ['BRIEF_TOKEN']}",
+                  "Authorization": f"Bearer {os.environ['OIDC_TOKEN']}",
                   "Content-Type": "application/json",
               },
           )
