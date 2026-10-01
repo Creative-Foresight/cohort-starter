@@ -78,31 +78,110 @@ jobs:
 
       - name: Run coding engine
         env:
-          OPENAI_API_KEY: ${{ secrets.COHORT_BUILD_OPENAI_API_KEY }}
+          # The engine signs in with a ChatGPT account (Codex's subscription
+          # sign-in), never an OpenAI API key: usage is capped by the plan
+          # instead of billed per token. The secret holds the auth.json that
+          # `codex login --device-auth` writes (see the Cohort docs).
+          CODEX_AUTH_JSON: ${{ secrets.COHORT_BUILD_CODEX_AUTH_JSON }}
           # Repo-configurable build command (audit H8: passed via env, never
           # interpolated into the script body).
           BUILD_COMMAND: ${{ vars.COHORT_BUILD_COMMAND || 'codex exec --dangerously-bypass-approvals-and-sandbox --output-last-message /tmp/engine-summary.md "$(cat /tmp/brief.md)"' }}
         run: |
           cp /tmp/cohort-brief/brief.md /tmp/brief.md
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::COHORT_BUILD_OPENAI_API_KEY repo secret is missing or empty — add it in Settings > Secrets and variables > Actions"
-            exit 1
-          fi
+          # No API-key path exists: drop every variable Codex would read as an
+          # API key or alternative login before anything runs.
+          unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_IDENTITY_TOKEN_FILE OPENAI_FEDERATION_RULE_ID OPENAI_WORKLOAD_IDENTITY_CONTEXT
+          export CODEX_HOME="$HOME/.codex"
+          mkdir -p "$CODEX_HOME"
+          chmod 700 "$CODEX_HOME"
+          # Validate the sign-in and write auth.json (0600). Fails with a
+          # readable reason if the secret is missing, is not a ChatGPT
+          # sign-in, or expires before this job could finish.
+          python3 - <<'PYEOF'
+          import base64, hashlib, json, os, sys, time
+
+          SECRET = "COHORT_BUILD_CODEX_AUTH_JSON"
+          FIX = ("Sign in again on a trusted machine and replace the secret: "
+                 "see Coding in the Cloud > Codex sign-in in the Cohort docs.")
+
+          def fail(reason):
+              print(f"::error::{SECRET}: {reason} {FIX}")
+              sys.exit(1)
+
+          raw = os.environ.get("CODEX_AUTH_JSON", "").strip()
+          if not raw:
+              fail("repository secret is missing or empty.")
+          try:
+              auth = json.loads(raw)
+          except ValueError:
+              fail("is not valid JSON (it must be the whole auth.json file).")
+          if not isinstance(auth, dict) or auth.get("auth_mode") != "chatgpt":
+              fail("is not a ChatGPT sign-in (auth_mode must be chatgpt; API-key logins are refused).")
+          tokens = auth.get("tokens") or {}
+          if not tokens.get("access_token") or not tokens.get("refresh_token"):
+              fail("has no ChatGPT tokens.")
+          try:
+              payload = tokens["access_token"].split(".")[1]
+              payload += "=" * (-len(payload) % 4)
+              expires = int(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+          except Exception:
+              fail("access token is unreadable.")
+          hours_left = (expires - time.time()) / 3600
+          # Stay clear of Codex's refresh window for the whole 45-minute job:
+          # every run shares this one sign-in, and a refresh rotates the
+          # refresh token that the other runs still hold.
+          if hours_left < 1:
+              fail("sign-in has expired or expires within the hour.")
+          if hours_left < 48:
+              print(f"::warning::{SECRET} expires in {hours_left:.0f} hours. {FIX}")
+          # Belt and braces: never carry an API key, even an unused one.
+          auth["OPENAI_API_KEY"] = None
+          path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "w") as f:
+              json.dump(auth, f)
+          os.chmod(path, 0o600)
+          digest = hashlib.sha256(tokens["refresh_token"].encode()).hexdigest()
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "codex-refresh.sha256"), "w") as f:
+              f.write(digest)
+          print(f"ChatGPT sign-in loaded ({hours_left:.0f} hours left).")
+          PYEOF
+          unset CODEX_AUTH_JSON
+          # ChatGPT sign-in only (Codex refuses and logs out any API-key auth),
+          # file-based credentials, and a model every ChatGPT plan includes.
+          printf '%s\n' 'forced_login_method = "chatgpt"' 'cli_auth_credentials_store = "file"' 'model = "gpt-6-astra"' > "$CODEX_HOME/config.toml"
           # Exact version, no install scripts (audit S-67).
           npm install -g --ignore-scripts @openai/codex@0.155.1
-          # Codex CLI ignores the OPENAI_API_KEY env var — it requires an explicit login.
-          printenv OPENAI_API_KEY | codex login --with-api-key
+          if ! codex login status 2>&1 | grep -qx "Logged in using ChatGPT"; then
+            echo "::error::Codex is not signed in with ChatGPT; refusing to run the engine."
+            exit 1
+          fi
           # Codex's own bubblewrap sandbox cannot start inside Actions runners
           # (bwrap loopback needs caps the runner doesn't grant). The ephemeral
           # runner VM with a read-only GITHUB_TOKEN is the sandbox here.
           # Audit H8 (2026-08-22): the --dangerously-bypass-approvals-and-sandbox
           # default stays deliberately — the runner itself is the confinement
           # boundary (ephemeral VM, read-only token, no repo write access, no
-          # OIDC, secrets limited to the build API key). Replacing this flag
+          # OIDC, secrets limited to the engine's sign-in). Replacing this flag
           # needs runner-level sandboxing work; revisit before syncing this
           # template into long-lived or self-hosted runner contexts.
           # Execute the configured command verbatim (audit H8: env-mediated).
           eval "$BUILD_COMMAND"
+
+      - name: Check the sign-in was not rotated
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib, json, os
+          before = os.path.join(os.environ["RUNNER_TEMP"], "codex-refresh.sha256")
+          after = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
+          if os.path.exists(before) and os.path.exists(after):
+              token = (json.load(open(after)).get("tokens") or {}).get("refresh_token") or ""
+              if hashlib.sha256(token.encode()).hexdigest() != open(before).read().strip():
+                  print("::warning::Codex refreshed the ChatGPT sign-in during this run, so the "
+                        "refresh token in COHORT_BUILD_CODEX_AUTH_JSON is now spent. Builds keep "
+                        "working until its access token expires; replace the secret before then.")
+          PYEOF
 
       - name: Collect changed files
         run: |
